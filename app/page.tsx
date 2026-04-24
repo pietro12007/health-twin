@@ -1,9 +1,90 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+
+// Web Speech API SpeechRecognition isn't in lib.dom.d.ts — declare what we use.
+type SpeechRecognitionAlt = { transcript: string; confidence: number };
+type SpeechRecognitionResult = {
+  isFinal: boolean;
+  length: number;
+  [index: number]: SpeechRecognitionAlt;
+};
+type SpeechRecognitionResultList = {
+  length: number;
+  [index: number]: SpeechRecognitionResult;
+};
+type SpeechRecognitionEventLike = {
+  results: SpeechRecognitionResultList;
+  resultIndex: number;
+};
+type SpeechRecognitionErrorEventLike = { error: string; message?: string };
+
+interface SpeechRecognitionLike {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+function getSpeechRecognition(): SpeechRecognitionConstructor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
+
+const noopSubscribe = () => () => {};
+const getSpeechRecognitionSupportedClient = () =>
+  getSpeechRecognition() !== null;
+const getSpeechSynthesisSupportedClient = () =>
+  typeof window !== "undefined" && "speechSynthesis" in window;
+const getCapabilityServerSnapshot = () => false;
+
+function stripMarkdownForTTS(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^\s*#{1,6}\s+/gm, "")
+    .replace(/^\s*>\s+/gm, "")
+    .replace(/[*_~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Chrome's SpeechSynthesis cuts off long utterances around ~15s. Splitting
+// into sentence-sized chunks works around it and gives smoother pacing.
+function chunkForTTS(text: string): string[] {
+  const cleaned = stripMarkdownForTTS(text);
+  if (!cleaned) return [];
+  const sentences = cleaned.match(/[^.!?]+[.!?]+|\S+[^.!?]*$/g) ?? [cleaned];
+  const chunks: string[] = [];
+  let current = "";
+  for (const s of sentences) {
+    const candidate = current ? `${current} ${s}` : s;
+    if (candidate.length > 220 && current) {
+      chunks.push(current.trim());
+      current = s.trim();
+    } else {
+      current = candidate.trim();
+    }
+  }
+  if (current) chunks.push(current.trim());
+  return chunks;
+}
 
 type HealthData = {
   age: string;
@@ -38,12 +119,107 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const speechRecognitionSupported = useSyncExternalStore(
+    noopSubscribe,
+    getSpeechRecognitionSupportedClient,
+    getCapabilityServerSnapshot,
+  );
+  const speechSynthesisSupported = useSyncExternalStore(
+    noopSubscribe,
+    getSpeechSynthesisSupportedClient,
+    getCapabilityServerSnapshot,
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const mutedRef = useRef(false);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.abort();
+      recognitionRef.current = null;
+      if (typeof window !== "undefined") {
+        window.speechSynthesis?.cancel();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    mutedRef.current = isMuted;
+    if (isMuted && typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
+  }, [isMuted]);
+
+  function speakText(text: string) {
+    if (typeof window === "undefined") return;
+    const synth = window.speechSynthesis;
+    if (!synth) return;
+    const chunks = chunkForTTS(text);
+    if (chunks.length === 0) return;
+    synth.cancel();
+    for (const chunk of chunks) {
+      const utterance = new SpeechSynthesisUtterance(chunk);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      synth.speak(utterance);
+    }
+  }
+
+  function startRecording() {
+    const SR = getSpeechRecognition();
+    if (!SR) return;
+    if (typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
+    const recognition = new SR();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event) => {
+      let transcript = "";
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i];
+        const alt = result[0];
+        if (alt) transcript += alt.transcript;
+      }
+      setInput(transcript);
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error !== "aborted" && event.error !== "no-speech") {
+        setError(`Voice input error: ${event.error}`);
+      }
+      setIsRecording(false);
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+      recognitionRef.current = null;
+    };
+
+    recognitionRef.current = recognition;
+    setInput("");
+    setError(null);
+    setIsRecording(true);
+    try {
+      recognition.start();
+    } catch {
+      setIsRecording(false);
+      recognitionRef.current = null;
+    }
+  }
+
+  function stopRecording() {
+    recognitionRef.current?.stop();
+  }
 
   const updateField =
     (key: keyof HealthData) =>
@@ -62,6 +238,10 @@ export default function Home() {
     setIsStreaming(true);
     setError(null);
     setMessages([...history, { role: "assistant", content: "" }]);
+
+    if (typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
 
     try {
       const res = await fetch("/api/chat", {
@@ -88,6 +268,10 @@ export default function Home() {
           return copy;
         });
       }
+
+      if (!mutedRef.current && acc.trim()) {
+        speakText(acc);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong.");
       setMessages((prev) => prev.slice(0, -1));
@@ -105,6 +289,7 @@ export default function Home() {
 
   async function handleSendMessage(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (isRecording) stopRecording();
     const text = input.trim();
     if (!text || isStreaming) return;
     setInput("");
@@ -116,6 +301,12 @@ export default function Home() {
     setMessages([]);
     setError(null);
     setInput("");
+    if (typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
+    recognitionRef.current?.abort();
+    recognitionRef.current = null;
+    setIsRecording(false);
   }
 
   if (view === "form") {
@@ -250,12 +441,28 @@ export default function Home() {
               {healthData.stress || "—"}/10 · {healthData.smoker || "—"}
             </p>
           </div>
-          <button
-            onClick={resetToForm}
-            className="text-sm text-gray-400 hover:text-white transition"
-          >
-            Edit profile
-          </button>
+          <div className="flex items-center gap-1">
+            {speechSynthesisSupported && (
+              <button
+                type="button"
+                onClick={() => setIsMuted((m) => !m)}
+                title={isMuted ? "Unmute voice output" : "Mute voice output"}
+                aria-label={
+                  isMuted ? "Unmute voice output" : "Mute voice output"
+                }
+                aria-pressed={isMuted}
+                className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition"
+              >
+                {isMuted ? <VolumeMutedIcon /> : <VolumeOnIcon />}
+              </button>
+            )}
+            <button
+              onClick={resetToForm}
+              className="text-sm text-gray-400 hover:text-white transition px-2 py-1"
+            >
+              Edit profile
+            </button>
+          </div>
         </div>
       </header>
 
@@ -289,16 +496,39 @@ export default function Home() {
       <footer className="border-t border-gray-800 bg-gray-950">
         <form
           onSubmit={handleSendMessage}
-          className="max-w-3xl mx-auto px-6 py-4 flex gap-2"
+          className="max-w-3xl mx-auto px-6 py-4 flex gap-2 items-stretch"
         >
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask your Digital Twin anything…"
+            placeholder={
+              isRecording
+                ? "Listening…"
+                : "Ask your Digital Twin anything…"
+            }
             disabled={isStreaming}
             className="flex-1 p-3 rounded-lg bg-gray-900 text-white border border-gray-800 focus:outline-none focus:border-blue-400 disabled:opacity-50"
           />
+          {speechRecognitionSupported && (
+            <button
+              type="button"
+              onClick={isRecording ? stopRecording : startRecording}
+              disabled={isStreaming}
+              title={isRecording ? "Stop recording" : "Record voice message"}
+              aria-label={
+                isRecording ? "Stop recording" : "Record voice message"
+              }
+              aria-pressed={isRecording}
+              className={
+                isRecording
+                  ? "px-3 bg-red-600 hover:bg-red-700 rounded-lg text-white transition animate-pulse"
+                  : "px-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              }
+            >
+              <MicIcon />
+            </button>
+          )}
           <button
             type="submit"
             disabled={isStreaming || input.trim() === ""}
@@ -443,5 +673,62 @@ function Dot({ delay }: { delay: string }) {
       className="inline-block w-2 h-2 rounded-full bg-gray-500 animate-bounce"
       style={{ animationDelay: delay }}
     />
+  );
+}
+
+function MicIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="w-5 h-5"
+      aria-hidden="true"
+    >
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="23" />
+      <line x1="8" y1="23" x2="16" y2="23" />
+    </svg>
+  );
+}
+
+function VolumeOnIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="w-5 h-5"
+      aria-hidden="true"
+    >
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
+    </svg>
+  );
+}
+
+function VolumeMutedIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="w-5 h-5"
+      aria-hidden="true"
+    >
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+      <line x1="23" y1="9" x2="17" y2="15" />
+      <line x1="17" y1="9" x2="23" y2="15" />
+    </svg>
   );
 }
