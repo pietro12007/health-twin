@@ -3,7 +3,8 @@
     "allow": [
       "Bash(npx tsc *)",
       "Bash(npx eslint *)",
-      "Bash(npx next *)"
+      "Bash(npx next *)",
+      "Bash(npm install *)"
     ]
   }
 }

@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent } from "react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type HealthData = {
   age: string;
@@ -318,12 +320,120 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         className={
           isUser
             ? "bg-blue-600 text-white rounded-2xl px-4 py-3 max-w-[80%] whitespace-pre-wrap"
-            : "bg-gray-900 border border-gray-800 text-gray-100 rounded-2xl px-4 py-3 max-w-[85%] whitespace-pre-wrap leading-relaxed"
+            : "bg-gray-900 border border-gray-800 text-gray-100 rounded-2xl px-4 py-3 max-w-[85%] leading-relaxed"
         }
       >
-        {message.content}
+        {isUser ? message.content : <AssistantMarkdown text={message.content} />}
       </div>
     </div>
+  );
+}
+
+function AssistantMarkdown({ text }: { text: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        h1: ({ children }: { children?: ReactNode }) => (
+          <h1 className="text-xl font-semibold text-white mt-3 mb-2 first:mt-0">
+            {children}
+          </h1>
+        ),
+        h2: ({ children }: { children?: ReactNode }) => (
+          <h2 className="text-lg font-semibold text-white mt-3 mb-2 first:mt-0">
+            {children}
+          </h2>
+        ),
+        h3: ({ children }: { children?: ReactNode }) => (
+          <h3 className="text-base font-semibold text-blue-300 mt-3 mb-1 first:mt-0">
+            {children}
+          </h3>
+        ),
+        h4: ({ children }: { children?: ReactNode }) => (
+          <h4 className="text-sm font-semibold text-blue-300 mt-3 mb-1 first:mt-0 uppercase tracking-wide">
+            {children}
+          </h4>
+        ),
+        p: ({ children }: { children?: ReactNode }) => (
+          <p className="my-2 first:mt-0 last:mb-0">{children}</p>
+        ),
+        ul: ({ children }: { children?: ReactNode }) => (
+          <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>
+        ),
+        ol: ({ children }: { children?: ReactNode }) => (
+          <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>
+        ),
+        li: ({ children }: { children?: ReactNode }) => (
+          <li className="leading-relaxed">{children}</li>
+        ),
+        strong: ({ children }: { children?: ReactNode }) => (
+          <strong className="font-semibold text-white">{children}</strong>
+        ),
+        em: ({ children }: { children?: ReactNode }) => (
+          <em className="italic">{children}</em>
+        ),
+        a: ({
+          children,
+          href,
+        }: {
+          children?: ReactNode;
+          href?: string;
+        }) => (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-blue-400 underline underline-offset-2 hover:text-blue-300"
+          >
+            {children}
+          </a>
+        ),
+        blockquote: ({ children }: { children?: ReactNode }) => (
+          <blockquote className="border-l-2 border-gray-700 pl-3 my-2 text-gray-300 italic">
+            {children}
+          </blockquote>
+        ),
+        code: ({
+          inline,
+          children,
+        }: {
+          inline?: boolean;
+          children?: ReactNode;
+        }) =>
+          inline ? (
+            <code className="bg-gray-800 text-blue-200 rounded px-1 py-0.5 text-[0.9em] font-mono">
+              {children}
+            </code>
+          ) : (
+            <code className="font-mono text-[0.9em]">{children}</code>
+          ),
+        pre: ({ children }: { children?: ReactNode }) => (
+          <pre className="bg-gray-950 border border-gray-800 rounded-lg p-3 my-2 overflow-x-auto text-sm">
+            {children}
+          </pre>
+        ),
+        hr: () => <hr className="border-gray-800 my-4" />,
+        table: ({ children }: { children?: ReactNode }) => (
+          <div className="overflow-x-auto my-2">
+            <table className="min-w-full text-sm border-collapse">
+              {children}
+            </table>
+          </div>
+        ),
+        th: ({ children }: { children?: ReactNode }) => (
+          <th className="border border-gray-800 bg-gray-800 px-2 py-1 text-left font-semibold">
+            {children}
+          </th>
+        ),
+        td: ({ children }: { children?: ReactNode }) => (
+          <td className="border border-gray-800 px-2 py-1 align-top">
+            {children}
+          </td>
+        ),
+      }}
+    >
+      {text}
+    </ReactMarkdown>
   );
 }
 
