@@ -17,6 +17,7 @@ type HealthData = {
   exercise: string;
   stress: string;
   smoker: string;
+  concerns?: string;
 };
 
 type ChatMessage = {
@@ -54,14 +55,19 @@ function buildBaseline(d: HealthData): SyntheticPatient {
 }
 
 function buildSystemPrompt(d: HealthData, b: SyntheticPatient): string {
-  const userProvided = [
+  const userProvidedLines = [
     `- Age: ${d.age || "(not provided)"}`,
     `- Resting heart rate: ${d.heartRate || "(not provided)"} bpm`,
     `- Sleep: ${d.sleep || "(not provided)"} hours/night`,
     `- Exercise: ${d.exercise || "(not provided)"} days/week`,
     `- Self-reported stress (1–10): ${d.stress || "(not provided)"}`,
     `- Smoking status: ${d.smoker || "(not provided)"}`,
-  ].join("\n");
+  ];
+  const concerns = d.concerns?.trim();
+  if (concerns) {
+    userProvidedLines.push(`- Stated concerns / goals: ${concerns}`);
+  }
+  const userProvided = userProvidedLines.join("\n");
 
   const assumed = [
     `- Gender: ${b.gender}`,

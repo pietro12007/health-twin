@@ -1,9 +1,16 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import type { ChangeEvent, FormEvent, ReactNode } from "react";
+import type { FormEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  FIELD_QUESTIONS,
+  ONBOARDING_FIELDS,
+  ONBOARDING_INTRO,
+  parseAnswer,
+  type OnboardingField,
+} from "@/lib/onboarding";
 
 // Web Speech API SpeechRecognition isn't in lib.dom.d.ts — declare what we use.
 type SpeechRecognitionAlt = { transcript: string; confidence: number };
@@ -93,6 +100,7 @@ type HealthData = {
   exercise: string;
   stress: string;
   smoker: string;
+  concerns?: string;
 };
 
 type ChatMessage = {
@@ -100,27 +108,58 @@ type ChatMessage = {
   content: string;
 };
 
-const initialHealthData: HealthData = {
-  age: "",
-  heartRate: "",
-  sleep: "",
-  exercise: "",
-  stress: "",
-  smoker: "No",
-};
+type CollectedAnswers = Partial<Record<OnboardingField, string>>;
+
+type View = "onboarding" | "building" | "chat";
 
 const KICKOFF_PROMPT =
-  "Give me a personalised, evidence-based snapshot of where my current habits are likely to take my health over the next 5–20 years. Anchor it in my actual numbers, call out the highest-impact change I should focus on first, and end with three concrete next steps.";
+  "Now that you've got my profile, give me a personalised, evidence-based snapshot of where my current habits are likely to take my health over the next 5–20 years. Anchor it in my actual numbers, weight it toward the concerns I just shared, and end with three concrete next steps.";
+
+const BUILDING_PHASES = [
+  "Loading your health profile…",
+  "Calibrating baseline metrics…",
+  "Cross-referencing the medical literature…",
+  "Projecting long-term trajectories…",
+];
+
+function buildHealthDataFromCollected(c: CollectedAnswers): HealthData {
+  return {
+    age: c.age ?? "",
+    heartRate: c.heartRate ?? "",
+    sleep: c.sleep ?? "",
+    exercise: c.exercise ?? "",
+    stress: c.stress ?? "",
+    smoker: c.smoker ?? "No",
+    concerns: c.concerns ?? "",
+  };
+}
+
+const initialHealthData: HealthData = buildHealthDataFromCollected({});
 
 export default function Home() {
+  const [view, setView] = useState<View>("onboarding");
   const [healthData, setHealthData] = useState<HealthData>(initialHealthData);
-  const [view, setView] = useState<"form" | "chat">("form");
+
+  // Onboarding state
+  const [collected, setCollected] = useState<CollectedAnswers>({});
+  const [stepIndex, setStepIndex] = useState(0);
+  const [onboardingMessages, setOnboardingMessages] = useState<ChatMessage[]>([
+    { role: "assistant", content: ONBOARDING_INTRO },
+  ]);
+
+  // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+
+  // Shared composer + voice state
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+
+  // Building animation
+  const [buildingPhase, setBuildingPhase] = useState(0);
+
   const speechRecognitionSupported = useSyncExternalStore(
     noopSubscribe,
     getSpeechRecognitionSupportedClient,
@@ -131,14 +170,21 @@ export default function Home() {
     getSpeechSynthesisSupportedClient,
     getCapabilityServerSnapshot,
   );
-  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const onboardingScrollRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const mutedRef = useRef(false);
 
   useEffect(() => {
-    const el = scrollRef.current;
+    const el =
+      view === "onboarding"
+        ? onboardingScrollRef.current
+        : view === "chat"
+          ? chatScrollRef.current
+          : null;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages]);
+  }, [view, onboardingMessages, messages]);
 
   useEffect(() => {
     return () => {
@@ -156,6 +202,26 @@ export default function Home() {
       window.speechSynthesis?.cancel();
     }
   }, [isMuted]);
+
+  // Speak the intro on mount. Some browsers (Safari) gate speechSynthesis
+  // behind a user gesture and will silently no-op the first call.
+  const introSpokenRef = useRef(false);
+  useEffect(() => {
+    if (introSpokenRef.current) return;
+    introSpokenRef.current = true;
+    if (!mutedRef.current) {
+      speakText(ONBOARDING_INTRO);
+    }
+  }, []);
+
+  // Cycle the subtext on the building screen.
+  useEffect(() => {
+    if (view !== "building") return;
+    const id = setInterval(() => {
+      setBuildingPhase((p) => (p + 1) % BUILDING_PHASES.length);
+    }, 700);
+    return () => clearInterval(id);
+  }, [view]);
 
   function speakText(text: string) {
     if (typeof window === "undefined") return;
@@ -221,20 +287,135 @@ export default function Home() {
     recognitionRef.current?.stop();
   }
 
-  const updateField =
-    (key: keyof HealthData) =>
-    (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-      setHealthData((prev) => ({ ...prev, [key]: e.target.value }));
+  async function streamOnboardingReply(
+    nextCollected: CollectedAnswers,
+    field: OnboardingField,
+    value: string,
+    isLast: boolean,
+  ): Promise<string> {
+    const nextQuestion = isLast
+      ? null
+      : FIELD_QUESTIONS[ONBOARDING_FIELDS[stepIndex + 1]];
+
+    setIsStreaming(true);
+    setError(null);
+    setOnboardingMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: "" },
+    ]);
+
+    if (typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
+
+    let acc = "";
+    try {
+      const res = await fetch("/api/onboarding", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          collected: nextCollected,
+          field,
+          value,
+          nextQuestion,
+        }),
+      });
+
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value: chunk, done } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(chunk, { stream: true });
+        setOnboardingMessages((prev) => {
+          const copy = prev.slice();
+          copy[copy.length - 1] = { role: "assistant", content: acc };
+          return copy;
+        });
+      }
+
+      if (!mutedRef.current && acc.trim()) {
+        speakText(acc);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
+      setOnboardingMessages((prev) => prev.slice(0, -1));
+      throw e;
+    } finally {
+      setIsStreaming(false);
+    }
+    return acc;
+  }
+
+  async function handleOnboardingSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (isRecording) stopRecording();
+    if (isStreaming) return;
+    const raw = input.trim();
+    if (!raw) return;
+
+    const field = ONBOARDING_FIELDS[stepIndex];
+    setInput("");
+    setOnboardingMessages((prev) => [...prev, { role: "user", content: raw }]);
+
+    const result = parseAnswer(field, raw);
+    if (!result.ok) {
+      setOnboardingMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: result.hint },
+      ]);
+      if (!mutedRef.current) speakText(result.hint);
+      return;
+    }
+
+    const nextCollected: CollectedAnswers = {
+      ...collected,
+      [field]: result.value,
     };
+    setCollected(nextCollected);
 
-  const isFormValid =
-    healthData.age !== "" &&
-    healthData.heartRate !== "" &&
-    healthData.sleep !== "" &&
-    healthData.exercise !== "" &&
-    healthData.stress !== "";
+    const isLast = stepIndex === ONBOARDING_FIELDS.length - 1;
 
-  async function streamReply(history: ChatMessage[]) {
+    try {
+      await streamOnboardingReply(nextCollected, field, result.value, isLast);
+    } catch {
+      // streamOnboardingReply already surfaced the error and rolled back.
+      return;
+    }
+
+    if (isLast) {
+      void transitionToChat(nextCollected);
+    } else {
+      setStepIndex((i) => i + 1);
+    }
+  }
+
+  async function transitionToChat(finalCollected: CollectedAnswers) {
+    const newHealthData = buildHealthDataFromCollected(finalCollected);
+    setHealthData(newHealthData);
+    setView("building");
+    setBuildingPhase(0);
+
+    await new Promise((r) => setTimeout(r, 3000));
+
+    setView("chat");
+    setMessages([]);
+    void streamChatReply(
+      [{ role: "user", content: KICKOFF_PROMPT }],
+      newHealthData,
+    );
+  }
+
+  async function streamChatReply(
+    history: ChatMessage[],
+    dataOverride?: HealthData,
+  ) {
+    const data = dataOverride ?? healthData;
     setIsStreaming(true);
     setError(null);
     setMessages([...history, { role: "assistant", content: "" }]);
@@ -247,7 +428,7 @@ export default function Home() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ healthData, messages: history }),
+        body: JSON.stringify({ healthData: data, messages: history }),
       });
 
       if (!res.ok || !res.body) {
@@ -280,193 +461,177 @@ export default function Home() {
     }
   }
 
-  function handleProfileSubmit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!isFormValid || isStreaming) return;
-    setView("chat");
-    void streamReply([{ role: "user", content: KICKOFF_PROMPT }]);
-  }
-
-  async function handleSendMessage(e: FormEvent<HTMLFormElement>) {
+  async function handleChatSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (isRecording) stopRecording();
     const text = input.trim();
     if (!text || isStreaming) return;
     setInput("");
-    await streamReply([...messages, { role: "user", content: text }]);
+    await streamChatReply([...messages, { role: "user", content: text }]);
   }
 
-  function resetToForm() {
-    setView("form");
-    setMessages([]);
-    setError(null);
-    setInput("");
+  function restart() {
     if (typeof window !== "undefined") {
       window.speechSynthesis?.cancel();
     }
     recognitionRef.current?.abort();
     recognitionRef.current = null;
     setIsRecording(false);
+    setInput("");
+    setError(null);
+    setMessages([]);
+    setHealthData(initialHealthData);
+    setCollected({});
+    setStepIndex(0);
+    setOnboardingMessages([
+      { role: "assistant", content: ONBOARDING_INTRO },
+    ]);
+    introSpokenRef.current = false;
+    setView("onboarding");
   }
 
-  if (view === "form") {
+  // ----- Onboarding view -----
+  if (view === "onboarding") {
     return (
-      <main className="min-h-screen bg-gray-950 text-white p-8">
-        <div className="max-w-2xl mx-auto">
-          <h1 className="text-4xl font-bold text-center mb-2 text-blue-400">
-            My Future Health
-          </h1>
-          <p className="text-center text-gray-400 mb-8">
-            Meet Your Digital Twin
-          </p>
-
-          <form
-            onSubmit={handleProfileSubmit}
-            className="bg-gray-900 rounded-2xl p-6 space-y-4"
-          >
-            <h2 className="text-xl font-semibold text-white">
-              Your Health Profile
-            </h2>
-
+      <main className="min-h-screen bg-gray-950 text-white flex flex-col">
+        <header className="border-b border-gray-800 bg-gray-950/80 backdrop-blur sticky top-0 z-10">
+          <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between">
             <div>
-              <label className="text-gray-400 text-sm">Age</label>
-              <input
-                type="number"
-                min={1}
-                max={120}
-                placeholder="e.g. 28"
-                value={healthData.age}
-                onChange={updateField("age")}
-                className="w-full mt-1 p-3 rounded-lg bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-blue-400"
+              <h1 className="text-xl font-semibold text-blue-400">
+                My Future Health
+              </h1>
+              <p className="text-xs text-gray-500">
+                Building your health profile · question{" "}
+                {Math.min(stepIndex + 1, ONBOARDING_FIELDS.length)} of{" "}
+                {ONBOARDING_FIELDS.length}
+              </p>
+            </div>
+            {speechSynthesisSupported && (
+              <MuteButton
+                isMuted={isMuted}
+                onToggle={() => setIsMuted((m) => !m)}
               />
-            </div>
+            )}
+          </div>
+          <ProgressBar
+            value={
+              Math.min(stepIndex, ONBOARDING_FIELDS.length) /
+              ONBOARDING_FIELDS.length
+            }
+          />
+        </header>
 
-            <div>
-              <label className="text-gray-400 text-sm">
-                Average Heart Rate (bpm)
-              </label>
-              <input
-                type="number"
-                min={30}
-                max={220}
-                placeholder="e.g. 72"
-                value={healthData.heartRate}
-                onChange={updateField("heartRate")}
-                className="w-full mt-1 p-3 rounded-lg bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-blue-400"
-              />
-            </div>
-
-            <div>
-              <label className="text-gray-400 text-sm">
-                Average Sleep (hours/night)
-              </label>
-              <input
-                type="number"
-                min={0}
-                max={24}
-                step="0.5"
-                placeholder="e.g. 7"
-                value={healthData.sleep}
-                onChange={updateField("sleep")}
-                className="w-full mt-1 p-3 rounded-lg bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-blue-400"
-              />
-            </div>
-
-            <div>
-              <label className="text-gray-400 text-sm">
-                Exercise (days/week)
-              </label>
-              <input
-                type="number"
-                min={0}
-                max={7}
-                placeholder="e.g. 3"
-                value={healthData.exercise}
-                onChange={updateField("exercise")}
-                className="w-full mt-1 p-3 rounded-lg bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-blue-400"
-              />
-            </div>
-
-            <div>
-              <label className="text-gray-400 text-sm">Stress Level (1-10)</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                placeholder="e.g. 5"
-                value={healthData.stress}
-                onChange={updateField("stress")}
-                className="w-full mt-1 p-3 rounded-lg bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-blue-400"
-              />
-            </div>
-
-            <div>
-              <label className="text-gray-400 text-sm">Smoker?</label>
-              <select
-                value={healthData.smoker}
-                onChange={updateField("smoker")}
-                className="w-full mt-1 p-3 rounded-lg bg-gray-800 text-white border border-gray-700 focus:outline-none focus:border-blue-400"
-              >
-                <option>No</option>
-                <option>Yes</option>
-                <option>Former smoker</option>
-              </select>
-            </div>
-
-            <button
-              type="submit"
-              disabled={!isFormValid}
-              className="w-full mt-4 p-4 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg font-semibold text-white transition"
-            >
-              Generate My Digital Twin →
-            </button>
-          </form>
+        <div ref={onboardingScrollRef} className="flex-1 overflow-y-auto">
+          <div className="max-w-3xl mx-auto px-6 py-6 space-y-4">
+            {onboardingMessages.map((m, i) => (
+              <MessageBubble key={i} message={m} />
+            ))}
+            {isStreaming &&
+              onboardingMessages.length > 0 &&
+              onboardingMessages[onboardingMessages.length - 1].role ===
+                "assistant" &&
+              onboardingMessages[onboardingMessages.length - 1].content ===
+                "" && <TypingDots />}
+            {error && <ErrorBanner message={error} />}
+          </div>
         </div>
+
+        <footer className="border-t border-gray-800 bg-gray-950">
+          <Composer
+            input={input}
+            onInputChange={setInput}
+            onSubmit={handleOnboardingSubmit}
+            isStreaming={isStreaming}
+            isRecording={isRecording}
+            onMicClick={isRecording ? stopRecording : startRecording}
+            speechRecognitionSupported={speechRecognitionSupported}
+            placeholder={
+              isRecording
+                ? "Listening…"
+                : "Type your answer, or tap the mic to speak…"
+            }
+            submitLabel="Send"
+          />
+        </footer>
       </main>
     );
   }
 
+  // ----- Building view -----
+  if (view === "building") {
+    return (
+      <main className="min-h-screen bg-gray-950 text-white flex items-center justify-center px-6">
+        <div className="flex flex-col items-center gap-8 text-center">
+          <div className="relative w-32 h-32">
+            <div className="absolute inset-0 rounded-full bg-gradient-to-br from-blue-500 via-cyan-400 to-blue-600 opacity-70 blur-2xl animate-pulse" />
+            <div className="absolute inset-2 rounded-full bg-gradient-to-br from-blue-400 via-cyan-300 to-blue-500 animate-spin-slow" />
+            <div className="absolute inset-6 rounded-full bg-gray-950 flex items-center justify-center">
+              <div className="w-3 h-3 rounded-full bg-cyan-300 animate-pulse" />
+            </div>
+          </div>
+          <div>
+            <h2 className="text-2xl font-semibold text-white">
+              Building your Digital Twin…
+            </h2>
+            <p className="text-gray-400 mt-2 min-h-[1.5em] transition-opacity">
+              {BUILDING_PHASES[buildingPhase]}
+            </p>
+          </div>
+        </div>
+        <style jsx>{`
+          @keyframes spin-slow {
+            from {
+              transform: rotate(0deg);
+            }
+            to {
+              transform: rotate(360deg);
+            }
+          }
+          .animate-spin-slow {
+            animation: spin-slow 4s linear infinite;
+          }
+        `}</style>
+      </main>
+    );
+  }
+
+  // ----- Chat view -----
   return (
     <main className="min-h-screen bg-gray-950 text-white flex flex-col">
       <header className="border-b border-gray-800 bg-gray-950/80 backdrop-blur sticky top-0 z-10">
-        <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between">
-          <div>
+        <div className="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between gap-4">
+          <div className="min-w-0">
             <h1 className="text-xl font-semibold text-blue-400">
               My Future Health
             </h1>
-            <p className="text-xs text-gray-500">
+            <p className="text-xs text-gray-500 truncate">
               Age {healthData.age || "—"} · HR {healthData.heartRate || "—"} bpm
               · Sleep {healthData.sleep || "—"}h · Exercise{" "}
               {healthData.exercise || "—"}×/wk · Stress{" "}
               {healthData.stress || "—"}/10 · {healthData.smoker || "—"}
+              {healthData.concerns
+                ? ` · Focus: ${healthData.concerns}`
+                : ""}
             </p>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 shrink-0">
             {speechSynthesisSupported && (
-              <button
-                type="button"
-                onClick={() => setIsMuted((m) => !m)}
-                title={isMuted ? "Unmute voice output" : "Mute voice output"}
-                aria-label={
-                  isMuted ? "Unmute voice output" : "Mute voice output"
-                }
-                aria-pressed={isMuted}
-                className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition"
-              >
-                {isMuted ? <VolumeMutedIcon /> : <VolumeOnIcon />}
-              </button>
+              <MuteButton
+                isMuted={isMuted}
+                onToggle={() => setIsMuted((m) => !m)}
+              />
             )}
             <button
-              onClick={resetToForm}
+              onClick={restart}
               className="text-sm text-gray-400 hover:text-white transition px-2 py-1"
             >
-              Edit profile
+              Restart
             </button>
           </div>
         </div>
       </header>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto">
+      <div ref={chatScrollRef} className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-6 py-6 space-y-4">
           {messages.map((m, i) => (
             <MessageBubble key={i} message={m} />
@@ -474,71 +639,147 @@ export default function Home() {
           {isStreaming &&
             messages.length > 0 &&
             messages[messages.length - 1].role === "assistant" &&
-            messages[messages.length - 1].content === "" && (
-              <div className="flex">
-                <div className="bg-gray-900 border border-gray-800 rounded-2xl px-4 py-3 text-gray-400">
-                  <span className="inline-flex gap-1">
-                    <Dot delay="0ms" />
-                    <Dot delay="150ms" />
-                    <Dot delay="300ms" />
-                  </span>
-                </div>
-              </div>
-            )}
-          {error && (
-            <div className="bg-red-950/50 border border-red-800 text-red-200 rounded-lg p-3 text-sm">
-              {error}
-            </div>
-          )}
+            messages[messages.length - 1].content === "" && <TypingDots />}
+          {error && <ErrorBanner message={error} />}
         </div>
       </div>
 
       <footer className="border-t border-gray-800 bg-gray-950">
-        <form
-          onSubmit={handleSendMessage}
-          className="max-w-3xl mx-auto px-6 py-4 flex gap-2 items-stretch"
-        >
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={
-              isRecording
-                ? "Listening…"
-                : "Ask your Digital Twin anything…"
-            }
-            disabled={isStreaming}
-            className="flex-1 p-3 rounded-lg bg-gray-900 text-white border border-gray-800 focus:outline-none focus:border-blue-400 disabled:opacity-50"
-          />
-          {speechRecognitionSupported && (
-            <button
-              type="button"
-              onClick={isRecording ? stopRecording : startRecording}
-              disabled={isStreaming}
-              title={isRecording ? "Stop recording" : "Record voice message"}
-              aria-label={
-                isRecording ? "Stop recording" : "Record voice message"
-              }
-              aria-pressed={isRecording}
-              className={
-                isRecording
-                  ? "px-3 bg-red-600 hover:bg-red-700 rounded-lg text-white transition animate-pulse"
-                  : "px-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
-              }
-            >
-              <MicIcon />
-            </button>
-          )}
-          <button
-            type="submit"
-            disabled={isStreaming || input.trim() === ""}
-            className="px-5 py-3 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg font-semibold text-white transition"
-          >
-            Send
-          </button>
-        </form>
+        <Composer
+          input={input}
+          onInputChange={setInput}
+          onSubmit={handleChatSubmit}
+          isStreaming={isStreaming}
+          isRecording={isRecording}
+          onMicClick={isRecording ? stopRecording : startRecording}
+          speechRecognitionSupported={speechRecognitionSupported}
+          placeholder={
+            isRecording ? "Listening…" : "Ask your Digital Twin anything…"
+          }
+          submitLabel="Send"
+        />
       </footer>
     </main>
+  );
+}
+
+// ---------- Subcomponents ----------
+
+type ComposerProps = {
+  input: string;
+  onInputChange: (v: string) => void;
+  onSubmit: (e: FormEvent<HTMLFormElement>) => void;
+  isStreaming: boolean;
+  isRecording: boolean;
+  onMicClick: () => void;
+  speechRecognitionSupported: boolean;
+  placeholder: string;
+  submitLabel: string;
+};
+
+function Composer({
+  input,
+  onInputChange,
+  onSubmit,
+  isStreaming,
+  isRecording,
+  onMicClick,
+  speechRecognitionSupported,
+  placeholder,
+  submitLabel,
+}: ComposerProps) {
+  return (
+    <form
+      onSubmit={onSubmit}
+      className="max-w-3xl mx-auto px-6 py-4 flex gap-2 items-stretch"
+    >
+      <input
+        type="text"
+        value={input}
+        onChange={(e) => onInputChange(e.target.value)}
+        placeholder={placeholder}
+        disabled={isStreaming}
+        className="flex-1 p-3 rounded-lg bg-gray-900 text-white border border-gray-800 focus:outline-none focus:border-blue-400 disabled:opacity-50"
+      />
+      {speechRecognitionSupported && (
+        <button
+          type="button"
+          onClick={onMicClick}
+          disabled={isStreaming}
+          title={isRecording ? "Stop recording" : "Record voice message"}
+          aria-label={isRecording ? "Stop recording" : "Record voice message"}
+          aria-pressed={isRecording}
+          className={
+            isRecording
+              ? "px-3 bg-red-600 hover:bg-red-700 rounded-lg text-white transition animate-pulse"
+              : "px-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+          }
+        >
+          <MicIcon />
+        </button>
+      )}
+      <button
+        type="submit"
+        disabled={isStreaming || input.trim() === ""}
+        className="px-5 py-3 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg font-semibold text-white transition"
+      >
+        {submitLabel}
+      </button>
+    </form>
+  );
+}
+
+function MuteButton({
+  isMuted,
+  onToggle,
+}: {
+  isMuted: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={isMuted ? "Unmute voice output" : "Mute voice output"}
+      aria-label={isMuted ? "Unmute voice output" : "Mute voice output"}
+      aria-pressed={isMuted}
+      className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition"
+    >
+      {isMuted ? <VolumeMutedIcon /> : <VolumeOnIcon />}
+    </button>
+  );
+}
+
+function ProgressBar({ value }: { value: number }) {
+  return (
+    <div className="h-1 bg-gray-900">
+      <div
+        className="h-full bg-blue-500 transition-all duration-500 ease-out"
+        style={{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }}
+      />
+    </div>
+  );
+}
+
+function TypingDots() {
+  return (
+    <div className="flex">
+      <div className="bg-gray-900 border border-gray-800 rounded-2xl px-4 py-3 text-gray-400">
+        <span className="inline-flex gap-1">
+          <Dot delay="0ms" />
+          <Dot delay="150ms" />
+          <Dot delay="300ms" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="bg-red-950/50 border border-red-800 text-red-200 rounded-lg p-3 text-sm">
+      {message}
+    </div>
   );
 }
 
