@@ -136,7 +136,7 @@ export async function POST(request: NextRequest) {
         let yieldedAny = false;
         try {
           const stream = client.messages.stream({
-            model: "claude-opus-4-5",
+            model: "claude-sonnet-4-5",
             max_tokens: 8192,
             system: SYSTEM_PROMPT + userProfileBlock(healthData),
             messages: messages.map((m) => ({
