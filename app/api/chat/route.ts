@@ -64,6 +64,31 @@ DEMO DATA:
 If the user has not provided health data, use these realistic defaults:
 Age 26, resting heart rate 68 bpm, sleep 6.5 hours, exercise 2 days per week, stress level 7/10, non-smoker, occasional alcohol.`;
 
+const FRIENDLY_ERROR_MESSAGE =
+  "Your Digital Twin is thinking... please try again in a moment.";
+
+// Manual retry policy on overloaded_error (HTTP 529).
+const MAX_RETRIES = 3; // retries after the initial attempt
+const RETRY_DELAY_MS = 2000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+function isOverloadedError(err: unknown): boolean {
+  return err instanceof Anthropic.APIError && err.status === 529;
+}
+
+// Friendly text response — status 200 so the client streams it into the
+// assistant bubble rather than into the red error banner.
+function friendlyResponse(): Response {
+  return new Response(FRIENDLY_ERROR_MESSAGE, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+    },
+  });
+}
+
 // Appended after the system prompt only when the user has actually filled in
 // their profile. When all fields are empty, the prompt's own demo defaults
 // take over.
@@ -84,53 +109,82 @@ function userProfileBlock(d: HealthData): string {
 
 export async function POST(request: NextRequest) {
   if (!process.env.ANTHROPIC_API_KEY) {
-    return Response.json(
-      { error: "ANTHROPIC_API_KEY is not configured on the server." },
-      { status: 500 },
-    );
+    console.error("ANTHROPIC_API_KEY is not configured.");
+    return friendlyResponse();
   }
 
   let body: { healthData?: HealthData; messages?: ChatMessage[] };
   try {
     body = await request.json();
   } catch {
-    return Response.json({ error: "Invalid JSON body." }, { status: 400 });
+    return friendlyResponse();
   }
 
   const { healthData, messages } = body;
   if (!healthData || !Array.isArray(messages) || messages.length === 0) {
-    return Response.json(
-      { error: "Request must include healthData and a non-empty messages array." },
-      { status: 400 },
-    );
+    return friendlyResponse();
   }
 
-  const client = new Anthropic();
-
-  const stream = client.messages.stream({
-    model: "claude-opus-4-5",
-    max_tokens: 8192,
-    system: SYSTEM_PROMPT + userProfileBlock(healthData),
-    messages: messages.map((m) => ({ role: m.role, content: m.content })),
-  });
-
+  // Disable the SDK's built-in 5xx retries so our manual loop is the single
+  // source of truth for retry behaviour on overloaded_error.
+  const client = new Anthropic({ maxRetries: 0 });
   const encoder = new TextEncoder();
+
   const readable = new ReadableStream<Uint8Array>({
     async start(controller) {
-      try {
-        for await (const event of stream) {
-          if (
-            event.type === "content_block_delta" &&
-            event.delta.type === "text_delta"
-          ) {
-            controller.enqueue(encoder.encode(event.delta.text));
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        let yieldedAny = false;
+        try {
+          const stream = client.messages.stream({
+            model: "claude-opus-4-5",
+            max_tokens: 8192,
+            system: SYSTEM_PROMPT + userProfileBlock(healthData),
+            messages: messages.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+          });
+
+          for await (const event of stream) {
+            if (
+              event.type === "content_block_delta" &&
+              event.delta.type === "text_delta"
+            ) {
+              controller.enqueue(encoder.encode(event.delta.text));
+              yieldedAny = true;
+            }
           }
+          controller.close();
+          return;
+        } catch (err) {
+          // Mid-stream errors can't be safely retried — the client would see
+          // a duplicated leading chunk on the next attempt. Append the friendly
+          // message inline and close.
+          if (yieldedAny) {
+            controller.enqueue(
+              encoder.encode(`\n\n${FRIENDLY_ERROR_MESSAGE}`),
+            );
+            controller.close();
+            return;
+          }
+
+          const overloaded = isOverloadedError(err);
+          const retriesLeft = MAX_RETRIES - attempt;
+
+          if (overloaded && retriesLeft > 0) {
+            console.warn(
+              `Anthropic overloaded (attempt ${attempt + 1}/${MAX_RETRIES + 1}); retrying in ${RETRY_DELAY_MS}ms`,
+            );
+            await sleep(RETRY_DELAY_MS);
+            continue;
+          }
+
+          // Either non-retryable, or out of retries.
+          console.error("Chat stream failed:", err);
+          controller.enqueue(encoder.encode(FRIENDLY_ERROR_MESSAGE));
+          controller.close();
+          return;
         }
-        controller.close();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "stream error";
-        controller.enqueue(encoder.encode(`\n\n[stream error: ${message}]`));
-        controller.close();
       }
     },
   });
