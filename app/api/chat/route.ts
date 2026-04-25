@@ -7,18 +7,9 @@ import {
   type SmokingStatus,
   type SyntheticPatient,
 } from "@/lib/patient";
+import type { HealthData } from "@/lib/health-types";
 
 export const runtime = "nodejs";
-
-type HealthData = {
-  age: string;
-  heartRate: string;
-  sleep: string;
-  exercise: string;
-  stress: string;
-  smoker: string;
-  concerns?: string;
-};
 
 type ChatMessage = {
   role: "user" | "assistant";

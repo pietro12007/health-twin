@@ -11,6 +11,9 @@ import {
   parseAnswer,
   type OnboardingField,
 } from "@/lib/onboarding";
+import HealthDashboard from "@/components/HealthDashboard";
+import AgingFace from "@/components/AgingFace";
+import type { HealthData } from "@/lib/health-types";
 
 // Web Speech API SpeechRecognition isn't in lib.dom.d.ts — declare what we use.
 type SpeechRecognitionAlt = { transcript: string; confidence: number };
@@ -93,16 +96,6 @@ function chunkForTTS(text: string): string[] {
   return chunks;
 }
 
-type HealthData = {
-  age: string;
-  heartRate: string;
-  sleep: string;
-  exercise: string;
-  stress: string;
-  smoker: string;
-  concerns?: string;
-};
-
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
@@ -110,7 +103,7 @@ type ChatMessage = {
 
 type CollectedAnswers = Partial<Record<OnboardingField, string>>;
 
-type View = "onboarding" | "building" | "chat";
+type View = "onboarding" | "building" | "dashboard" | "chat";
 
 const KICKOFF_PROMPT =
   "Now that you've got my profile, give me a personalised, evidence-based snapshot of where my current habits are likely to take my health over the next 5–20 years. Anchor it in my actual numbers, weight it toward the concerns I just shared, and end with three concrete next steps.";
@@ -403,11 +396,15 @@ export default function Home() {
 
     await new Promise((r) => setTimeout(r, 3000));
 
+    setView("dashboard");
+  }
+
+  function handleDashboardContinue() {
     setView("chat");
     setMessages([]);
     void streamChatReply(
       [{ role: "user", content: KICKOFF_PROMPT }],
-      newHealthData,
+      healthData,
     );
   }
 
@@ -595,7 +592,21 @@ export default function Home() {
     );
   }
 
+  // ----- Dashboard view -----
+  if (view === "dashboard") {
+    return (
+      <HealthDashboard
+        healthData={healthData}
+        onContinue={handleDashboardContinue}
+      />
+    );
+  }
+
   // ----- Chat view -----
+  const lastMessage = messages[messages.length - 1];
+  const latestAssistantText =
+    lastMessage && lastMessage.role === "assistant" ? lastMessage.content : "";
+
   return (
     <main className="min-h-screen bg-gray-950 text-white flex flex-col">
       <header className="border-b border-gray-800 bg-gray-950/80 backdrop-blur sticky top-0 z-10">
@@ -632,7 +643,13 @@ export default function Home() {
       </header>
 
       <div ref={chatScrollRef} className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto px-6 py-6 space-y-4">
+        <div className="max-w-3xl mx-auto px-6 pt-8 pb-6">
+          <AgingFace
+            healthData={healthData}
+            latestAssistantText={latestAssistantText}
+          />
+        </div>
+        <div className="max-w-3xl mx-auto px-6 pb-6 space-y-4">
           {messages.map((m, i) => (
             <MessageBubble key={i} message={m} />
           ))}
