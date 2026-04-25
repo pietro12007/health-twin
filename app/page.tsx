@@ -13,6 +13,9 @@ import {
 } from "@/lib/onboarding";
 import HealthDashboard from "@/components/HealthDashboard";
 import AgingFace from "@/components/AgingFace";
+import PhotoOnboarding from "@/components/PhotoOnboarding";
+import PersonalizedAgingFace from "@/components/PersonalizedAgingFace";
+import { processPhoto, type ProcessedPhoto } from "@/lib/face-processing";
 import type { HealthData } from "@/lib/health-types";
 
 // Web Speech API SpeechRecognition isn't in lib.dom.d.ts — declare what we use.
@@ -103,7 +106,13 @@ type ChatMessage = {
 
 type CollectedAnswers = Partial<Record<OnboardingField, string>>;
 
-type View = "onboarding" | "building" | "dashboard" | "chat";
+type View =
+  | "photo"
+  | "photo-processing"
+  | "onboarding"
+  | "building"
+  | "dashboard"
+  | "chat";
 
 const KICKOFF_PROMPT =
   "Now that you've got my profile, give me a personalised, evidence-based snapshot of where my current habits are likely to take my health over the next 5–20 years. Anchor it in my actual numbers, weight it toward the concerns I just shared, and end with three concrete next steps.";
@@ -130,8 +139,9 @@ function buildHealthDataFromCollected(c: CollectedAnswers): HealthData {
 const initialHealthData: HealthData = buildHealthDataFromCollected({});
 
 export default function Home() {
-  const [view, setView] = useState<View>("onboarding");
+  const [view, setView] = useState<View>("photo");
   const [healthData, setHealthData] = useState<HealthData>(initialHealthData);
+  const [photo, setPhoto] = useState<ProcessedPhoto | null>(null);
 
   // Onboarding state
   const [collected, setCollected] = useState<CollectedAnswers>({});
@@ -388,6 +398,41 @@ export default function Home() {
     }
   }
 
+  async function handlePhotoCaptured(rawDataUrl: string) {
+    setView("photo-processing");
+    try {
+      const processed = await processPhoto(rawDataUrl);
+      setPhoto(processed);
+    } catch (err) {
+      console.warn("Photo processing failed, falling back to raw image:", err);
+      setPhoto({
+        croppedDataUrl: rawDataUrl,
+        originalDataUrl: rawDataUrl,
+        faceBox: null,
+        keypoints: null,
+        detected: false,
+      });
+    } finally {
+      setView("onboarding");
+    }
+  }
+
+  function handlePhotoSkipped() {
+    setPhoto(null);
+    setView("onboarding");
+  }
+
+  function handleRetakePhoto() {
+    if (typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
+    recognitionRef.current?.abort();
+    recognitionRef.current = null;
+    setIsRecording(false);
+    setPhoto(null);
+    setView("photo");
+  }
+
   async function transitionToChat(finalCollected: CollectedAnswers) {
     const newHealthData = buildHealthDataFromCollected(finalCollected);
     setHealthData(newHealthData);
@@ -484,7 +529,42 @@ export default function Home() {
       { role: "assistant", content: ONBOARDING_INTRO },
     ]);
     introSpokenRef.current = false;
-    setView("onboarding");
+    setPhoto(null);
+    setView("photo");
+  }
+
+  // ----- Photo onboarding view -----
+  if (view === "photo") {
+    return (
+      <PhotoOnboarding
+        onComplete={handlePhotoCaptured}
+        onSkip={handlePhotoSkipped}
+      />
+    );
+  }
+
+  if (view === "photo-processing") {
+    return (
+      <main className="min-h-screen bg-gray-950 text-white flex items-center justify-center px-6">
+        <div className="flex flex-col items-center gap-6 text-center">
+          <div className="relative w-20 h-20">
+            <div className="absolute inset-0 rounded-full bg-gradient-to-br from-blue-500 to-cyan-400 blur-2xl opacity-60 animate-pulse" />
+            <div className="absolute inset-0 rounded-full border-2 border-blue-400/40 animate-spin" />
+          </div>
+          <div>
+            <p className="text-sm uppercase tracking-[0.25em] text-blue-400 font-semibold">
+              Analysing
+            </p>
+            <h2 className="text-xl font-semibold mt-2">
+              Detecting your face…
+            </h2>
+            <p className="text-xs text-gray-500 mt-2 max-w-xs">
+              Loading the on-device face model. This only happens once.
+            </p>
+          </div>
+        </div>
+      </main>
+    );
   }
 
   // ----- Onboarding view -----
@@ -606,6 +686,15 @@ export default function Home() {
   const lastMessage = messages[messages.length - 1];
   const latestAssistantText =
     lastMessage && lastMessage.role === "assistant" ? lastMessage.content : "";
+  // Index of the current assistant message — increments when a new
+  // assistant turn starts. Used to gate one flash-effect trigger per turn.
+  let latestAssistantIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") {
+      latestAssistantIndex = i;
+      break;
+    }
+  }
 
   return (
     <main className="min-h-screen bg-gray-950 text-white flex flex-col">
@@ -643,11 +732,21 @@ export default function Home() {
       </header>
 
       <div ref={chatScrollRef} className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto px-6 pt-8 pb-6">
-          <AgingFace
-            healthData={healthData}
-            latestAssistantText={latestAssistantText}
-          />
+        <div className="max-w-3xl mx-auto px-6 pt-8 pb-6 flex flex-col items-center">
+          {photo ? (
+            <PersonalizedAgingFace
+              healthData={healthData}
+              photo={photo}
+              latestAssistantText={latestAssistantText}
+              messageKey={latestAssistantIndex}
+              onRetakePhoto={handleRetakePhoto}
+            />
+          ) : (
+            <AgingFace
+              healthData={healthData}
+              latestAssistantText={latestAssistantText}
+            />
+          )}
         </div>
         <div className="max-w-3xl mx-auto px-6 pb-6 space-y-4">
           {messages.map((m, i) => (
