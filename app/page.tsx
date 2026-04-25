@@ -15,7 +15,11 @@ import HealthDashboard from "@/components/HealthDashboard";
 import AgingFace from "@/components/AgingFace";
 import PhotoOnboarding from "@/components/PhotoOnboarding";
 import PersonalizedAgingFace from "@/components/PersonalizedAgingFace";
+import BehaviorSimulator, {
+  type SimulatorHealthData,
+} from "@/components/BehaviorSimulator";
 import { processPhoto, type ProcessedPhoto } from "@/lib/face-processing";
+import { deriveMetrics } from "@/lib/health-metrics";
 import type { HealthData } from "@/lib/health-types";
 
 // Web Speech API SpeechRecognition isn't in lib.dom.d.ts — declare what we use.
@@ -112,7 +116,20 @@ type View =
   | "onboarding"
   | "building"
   | "dashboard"
+  | "simulator"
   | "chat";
+
+function toSimulatorHealthData(d: HealthData): SimulatorHealthData {
+  const m = deriveMetrics(d);
+  return {
+    age: m.age,
+    heartRate: m.heartRate,
+    sleep: m.sleep,
+    exercise: m.exercise,
+    stress: m.stress,
+    smoker: d.smoker || "No",
+  };
+}
 
 const KICKOFF_PROMPT =
   "Now that you've got my profile, give me a personalised, evidence-based snapshot of where my current habits are likely to take my health over the next 5–20 years. Anchor it in my actual numbers, weight it toward the concerns I just shared, and end with three concrete next steps.";
@@ -445,6 +462,16 @@ export default function Home() {
   }
 
   function handleDashboardContinue() {
+    setView("simulator");
+  }
+
+  function handleSimulatorAsk(message: string) {
+    setView("chat");
+    setMessages([]);
+    void streamChatReply([{ role: "user", content: message }], healthData);
+  }
+
+  function handleSimulatorSkip() {
     setView("chat");
     setMessages([]);
     void streamChatReply(
@@ -679,6 +706,50 @@ export default function Home() {
         healthData={healthData}
         onContinue={handleDashboardContinue}
       />
+    );
+  }
+
+  // ----- Simulator view -----
+  if (view === "simulator") {
+    return (
+      <main className="min-h-screen bg-gray-950 text-white">
+        <div className="max-w-5xl mx-auto px-6 py-10 md:py-12">
+          <div className="flex items-start justify-between gap-4 mb-2">
+            <div>
+              <p className="text-xs uppercase tracking-[0.3em] text-blue-400 font-semibold">
+                Try the levers
+              </p>
+              <h1 className="text-3xl md:text-4xl font-bold mt-2">
+                What changes if you change one thing?
+              </h1>
+              <p className="text-gray-400 mt-3 max-w-2xl">
+                Drag a slider and watch the risk profile recompute live. When a
+                scenario interests you, send it to your Twin for a deeper read.
+              </p>
+            </div>
+            <button
+              onClick={restart}
+              className="text-sm text-gray-400 hover:text-white transition px-2 py-1 shrink-0"
+            >
+              Restart
+            </button>
+          </div>
+
+          <BehaviorSimulator
+            healthData={toSimulatorHealthData(healthData)}
+            onSendMessage={handleSimulatorAsk}
+          />
+
+          <div className="mt-8 text-center">
+            <button
+              onClick={handleSimulatorSkip}
+              className="text-sm text-gray-400 hover:text-white transition underline-offset-4 hover:underline"
+            >
+              Skip the simulator and just chat →
+            </button>
+          </div>
+        </div>
+      </main>
     );
   }
 

@@ -102,7 +102,8 @@ export type RiskKey =
   | "cardiovascular"
   | "diabetes"
   | "alzheimers"
-  | "metabolicSyndrome";
+  | "metabolicSyndrome"
+  | "stroke";
 
 export type DiseaseRisks = Record<RiskKey, number>;
 
@@ -111,39 +112,76 @@ export const RISK_LABELS: Record<RiskKey, string> = {
   diabetes: "Type 2 Diabetes",
   alzheimers: "Alzheimer's Disease",
   metabolicSyndrome: "Metabolic Syndrome",
+  stroke: "Stroke",
 };
 
+// Coefficients are illustrative — see header comment for clinical caveat.
 export function computeRisks(m: Metrics): DiseaseRisks {
-  const cap = (n: number, lo = 0, hi = 95) => Math.max(lo, Math.min(hi, n));
+  const cap = (n: number, lo = 2, hi = 95) =>
+    Math.max(lo, Math.min(hi, n));
+  const clamp = (v: number, lo: number, hi: number) =>
+    Math.max(lo, Math.min(hi, v));
 
-  let cv = (m.age / 100) * 15;
-  if (m.smokerStatus === "smoker") cv += 40;
-  if (m.stress > 7) cv += 20;
-  if (m.heartRate > 85) cv += 15;
-  if (m.exercise > 4) cv -= 15;
+  // Cardiovascular (AHA, EHJ)
+  let cardio = (m.age / 100) * 18;
+  if (m.smokerStatus === "smoker") cardio += 42;
+  else if (m.smokerStatus === "former") cardio += 12;
+  if (m.stress > 7) cardio += 20;
+  else if (m.stress > 4) cardio += (m.stress - 4) * 4;
+  if (m.heartRate > 90) cardio += 18;
+  else if (m.heartRate > 80) cardio += 10;
+  else if (m.heartRate > 70) cardio += 4;
+  if (m.exercise >= 5) cardio -= 18;
+  else if (m.exercise >= 3) cardio -= 12;
+  else if (m.exercise >= 1.5) cardio -= 6;
+  if (m.sleep >= 7 && m.sleep <= 9) cardio -= 5;
 
-  let dm = (m.age / 100) * 10;
-  if (m.sleep < 6) dm += 37;
-  if (m.exercise < 2) dm += 25;
-  if (m.stress > 7) dm += 20;
-  if (m.exercise > 4) dm -= 20;
+  // Type 2 Diabetes (Harvard, Lancet)
+  let dm = (m.age / 100) * 12;
+  if (m.sleep < 6) dm += clamp((6 - m.sleep) * 20, 0, 40);
+  else if (m.sleep > 9) dm += 8;
+  if (m.exercise < 1.5) dm += 28;
+  else if (m.exercise < 3) dm += 14;
+  else if (m.exercise >= 5) dm -= 22;
+  else if (m.exercise >= 3) dm -= 12;
+  if (m.stress > 7) dm += 18;
+  if (m.smokerStatus === "smoker") dm += 14;
 
-  let alz = (m.age / 100) * 8;
-  if (m.exercise > 4) alz -= 45;
-  if (m.sleep < 6) alz += 30;
-  if (m.stress > 7) alz += 20;
+  // Alzheimer's (Lancet Neurology Commission)
+  let alz = (m.age / 100) * 10;
+  if (m.exercise >= 5) alz -= 45;
+  else if (m.exercise >= 3) alz -= 28;
+  else if (m.exercise >= 1.5) alz -= 14;
+  if (m.sleep < 6) alz += clamp((6 - m.sleep) * 18, 0, 36);
+  else if (m.sleep > 9) alz += 10;
+  if (m.stress > 7) alz += 22;
+  else if (m.stress > 5) alz += 10;
+  if (m.smokerStatus === "smoker") alz += 16;
 
-  let ms = (m.age / 100) * 12;
-  if (m.exercise < 2) ms += 30;
-  if (m.stress > 7) ms += 25;
-  if (m.smokerStatus === "smoker") ms += 20;
-  if (m.exercise > 4) ms -= 25;
+  // Metabolic Syndrome (WHO, AHA)
+  let metab = (m.age / 100) * 14;
+  if (m.exercise < 1.5) metab += 32;
+  else if (m.exercise < 3) metab += 18;
+  else if (m.exercise >= 5) metab -= 26;
+  else if (m.exercise >= 3) metab -= 14;
+  if (m.stress > 7) metab += 26;
+  else if (m.stress > 5) metab += 12;
+  if (m.smokerStatus === "smoker") metab += 22;
+  if (m.sleep < 6) metab += 15;
+
+  // Stroke (AHA/ASA)
+  let stroke = (m.age / 100) * 10;
+  if (m.smokerStatus === "smoker") stroke += 30;
+  if (m.heartRate > 90) stroke += 14;
+  if (m.stress > 7) stroke += 16;
+  if (m.exercise >= 4) stroke -= 20;
 
   return {
-    cardiovascular: Math.round(cap(cv)),
+    cardiovascular: Math.round(cap(cardio)),
     diabetes: Math.round(cap(dm)),
-    alzheimers: Math.round(cap(alz, 2)),
-    metabolicSyndrome: Math.round(cap(ms)),
+    alzheimers: Math.round(cap(alz)),
+    metabolicSyndrome: Math.round(cap(metab)),
+    stroke: Math.round(cap(stroke)),
   };
 }
 
@@ -314,6 +352,7 @@ export function identifyBestChange(m: Metrics): BestChange {
     diabetes: "your type 2 diabetes risk",
     alzheimers: "your Alzheimer's risk",
     metabolicSyndrome: "your metabolic syndrome risk",
+    stroke: "your stroke risk",
   };
 
   return {

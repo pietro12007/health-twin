@@ -236,6 +236,7 @@ function RiskPanel({ risks }: { risks: DiseaseRisks }) {
     "diabetes",
     "alzheimers",
     "metabolicSyndrome",
+    "stroke",
   ];
 
   return (
